@@ -1,0 +1,131 @@
+import os
+import sys
+from typing import Optional
+
+# If you have "langchain_community" installed:
+# pip install -U langchain-community
+from langchain_community.utilities import SQLDatabase
+from langchain_community.tools import QuerySQLDatabaseTool
+from langchain_huggingface import HuggingFacePipeline
+from langchain.chains import create_sql_query_chain
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+from sqlalchemy import create_engine
+import langchain
+langchain.debug = True
+
+##############################
+# TINYLLAMA LOAD
+##############################
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+def load_tinyllama_langchain_llm():
+    print("⏳ Loading TinyLlama model (HuggingFace style)...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    print("✅ Model loaded!")
+
+    hf_pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=128,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=False,
+    )
+    # Convert to a LangChain-compatible LLM
+    llm = HuggingFacePipeline(pipeline=hf_pipe)
+    return llm
+
+def pick_tables(question: str, all_tables: list) -> list:
+    """Naive approach: pick tables whose names appear in the user's question."""
+    question_lower = question.lower()
+    relevant = [t for t in all_tables if t.lower() in question_lower]
+    return relevant or all_tables[:3]
+
+def main():
+    # 1) Load the TinyLlama model
+    llm = load_tinyllama_langchain_llm()
+
+    # 2) MySQL credentials
+    user = "root"
+    password = "admin"
+    host = "localhost"
+    port = 3306
+    database = "chatbot"
+    db_uri = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+    print("\n🔹TinyLlama Chat w/ MySQL (Only raw DB data printed)\n")
+    print("Type 'exit' or 'quit' to stop.\n")
+
+    # Wide DB for table discovery
+    wide_db = SQLDatabase.from_uri(db_uri)
+    all_table_names = wide_db.get_usable_table_names()
+
+    # Tool to actually run queries
+    query_tool = QuerySQLDatabaseTool(db=wide_db)
+
+    # The chain wants input_variables=["input", "table_info", "top_k"].
+    # We'll provide "top_k" as a partial variable (hard-coded), so we
+    # don't have to pass it as a function argument to create_sql_query_chain.
+    custom_prompt = PromptTemplate(
+        input_variables=["input", "table_info"],  # only these are set at runtime
+        partial_variables={"top_k": "3"},         # set "top_k" as a fixed partial
+        template=(
+            "You have the following schema:\n"
+            "{table_info}\n\n"
+            "The user asked:\n{input}\n\n"
+            "We have top_k={top_k}.\n"
+            "Generate a valid MySQL query.\n"
+            "Return ONLY the SQL statement. No chain-of-thought.\n"
+        )
+    )
+
+    while True:
+        question = input("User Question: ")
+        if question.strip().lower() in ["exit", "quit"]:
+            break
+
+        # 3) pick relevant tables
+        relevant_tables = pick_tables(question, all_table_names)
+        print(f"[DEBUG] Using tables: {relevant_tables}")
+
+        # 4) reflect columns for the relevant tables
+        filtered_db = SQLDatabase.from_uri(db_uri, include_tables=relevant_tables)
+
+        # 5) Build the chain with our custom prompt
+        #    NO 'top_k' param in the function call, because your version doesn't allow it
+        chain = create_sql_query_chain(
+            llm=llm,
+            db=filtered_db,
+            prompt=custom_prompt
+        )
+
+        try:
+            # The chain expects input={"input": ...}
+            sql_query_raw = chain.invoke({"input": question})
+            # Stripping any extra text:
+            sql_query = StrOutputParser().parse(sql_query_raw)
+            print(f"\n[DEBUG] Generated SQL Query:\n{sql_query}\n")
+
+            # 6) Execute the query
+            rows = query_tool.run(sql_query)
+            print("DB Results:\n", rows)
+
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+
+    print("👋 Exiting. Goodbye!")
+
+if __name__ == "__main__":
+    main()
