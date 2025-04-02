@@ -1,0 +1,115 @@
+import os
+import sys
+
+import logging
+
+# Turn off most LangChain logs:
+logging.getLogger("langchain").setLevel(logging.ERROR)
+
+from langchain_community.utilities import SQLDatabase
+from langchain_community.tools import QuerySQLDatabaseTool
+from langchain_huggingface import HuggingFacePipeline
+
+import langchain
+# Force disabling debug
+langchain.debug = False
+
+##############################
+# TINYLLAMA LOAD
+##############################
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+def load_tinyllama_langchain_llm():
+    print("⏳ Loading TinyLlama model (HuggingFace style)...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    print("✅ Model loaded!")
+    hf_pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=128,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=False,  # more deterministic
+    )
+    return HuggingFacePipeline(pipeline=hf_pipe)
+
+def prompt_for_sql(llm, schema: str, user_question: str) -> str:
+    """
+    Directly prompt the LLM: Provide only SQL, no chain-of-thought.
+    """
+    prompt = (
+        "You have the following database schema:\n"
+        f"{schema}\n\n"
+        "User question:\n"
+        f"{user_question}\n\n"
+        "Generate a valid MySQL query that answers the user's question. "
+        "Output ONLY the SQL. No explanation, no chain-of-thought."
+    )
+    result = llm(prompt)
+    # In case the model outputs extra text, let's do a quick sanity strip:
+    return result.strip()
+
+def main():
+    # 1) Load LLM (TinyLlama)
+    llm = load_tinyllama_langchain_llm()
+
+    # 2) MySQL credentials
+    user = "root"
+    password = "admin"
+    host = "localhost"
+    port = 3306
+    database = "chatbot"
+    db_uri = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+    print("\n🔹 TinyLlama MySQL Demo (Raw DB results only). Type 'exit' or 'quit' to stop.\n")
+
+    # 3) DB reflection just to create the schema text:
+    db = SQLDatabase.from_uri(db_uri)
+    # Gather a textual description of all tables:
+    #   e.g. "Table: employees\n  - id (INTEGER)\n  - name (TEXT)\n..."
+    # You can code your own function or use db.metadata etc.
+    schema_lines = []
+    for tbl in db.get_usable_table_names():
+        schema_lines.append(f"Table: {tbl}")
+        columns = db.get_table_info(tbl)
+        for c in columns:
+            col_name = c['name']
+            col_type = str(c['type'])
+            schema_lines.append(f"  - {col_name} ({col_type})")
+        schema_lines.append("")
+    schema_text = "\n".join(schema_lines).strip()
+
+    # 4) Tool to execute queries
+    query_tool = QuerySQLDatabaseTool(db=db)
+
+    while True:
+        user_question = input("User Question: ")
+        if user_question.lower() in ["exit", "quit"]:
+            break
+
+        # 5) Prompt the LLM for a single SQL query
+        sql_query = prompt_for_sql(llm, schema_text, user_question)
+        print(f"\n[DEBUG] LLM's Proposed SQL:\n{sql_query}\n")
+
+        # 6) Execute and print results
+        try:
+            rows = query_tool.run(sql_query)
+            print("[DB Results]:\n")
+            print(rows, "\n")
+        except Exception as e:
+            print(f"\n❌ Error running query: {e}\n")
+
+    print("👋 Exiting. Goodbye!")
+
+if __name__ == "__main__":
+    main()
