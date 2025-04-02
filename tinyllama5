@@ -1,0 +1,119 @@
+import os
+import sys
+from typing import Optional
+
+import logging
+# Disable LangChain debug logs
+logging.getLogger("langchain").setLevel(logging.ERROR)
+
+# If you have "langchain_community" installed:
+# pip install -U langchain-community
+from langchain_community.utilities import SQLDatabase
+from langchain_community.tools import QuerySQLDatabaseTool
+from langchain_huggingface import HuggingFacePipeline
+from langchain.chains import create_sql_query_chain
+from langchain.agents.agent_types import AgentType
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+from sqlalchemy import create_engine
+import langchain
+langchain.debug = False  # Disable debug logging
+
+##############################
+# TINYLLAMA LOAD
+##############################
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+def load_tinyllama_langchain_llm():
+    print("⏳ Loading TinyLlama model (HuggingFace style)...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    print("✅ Model loaded!")
+    hf_pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=256,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    # Wrap pipeline in a LangChain-compatible LLM
+    llm = HuggingFacePipeline(pipeline=hf_pipe)
+    return llm
+
+##############################
+# PARTIAL SCHEMA SELECTION
+##############################
+def pick_tables(question: str, all_tables: list) -> list:
+    """Naive approach: pick tables whose names appear in the question."""
+    question_lower = question.lower()
+    relevant = [t for t in all_tables if t.lower() in question_lower]
+    # Fallback if no match
+    return relevant or all_tables[:3]
+
+def main():
+    # 1) Load the TinyLlama model
+    llm = load_tinyllama_langchain_llm()
+
+    # 2) MySQL credentials
+    user = "root"
+    password = "admin"
+    host = "localhost"
+    port = 3306
+    database = "chatbot"
+    db_uri = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+    print("\n🔹TinyLlama Chat w/ MySQL using LangChain.\n")
+    print("Type 'exit' or 'quit' to stop.\n")
+
+    # 3) Build a "wide" DB object for table discovery
+    wide_db = SQLDatabase.from_uri(db_uri)
+    all_table_names = wide_db.get_usable_table_names()
+    print(f"[DEBUG] Table Names: {all_table_names}")
+
+    while True:
+        question = input("User Question: ")
+        if question.strip().lower() in ["exit", "quit"]:
+            break
+
+        # 4) Choose relevant tables
+        relevant_tables = pick_tables(question, all_table_names)
+        print(f"[DEBUG] Using these tables: {relevant_tables}")
+
+        # 5) Reflect columns only for relevant tables
+        filtered_db = SQLDatabase.from_uri(db_uri, include_tables=relevant_tables)
+
+        # 6) Create a custom prompt to only generate a valid MySQL query with no extra text.
+        custom_prompt = PromptTemplate.from_template(
+            "Generate a valid MySQL query for the following question:\n"
+            "{question}\n\n"
+            "Return ONLY the SQL query. No extra explanation or examples."
+        )
+
+        # 7) Create the SQL query chain with the custom prompt.
+        chain = create_sql_query_chain(
+            llm=llm,
+            db=filtered_db,
+            prompt=custom_prompt
+        )
+
+        try:
+            # The chain expects {"question": question}
+            result = chain.invoke({"question": question})
+            print(f"\nAssistant Answer:\n{result}\n")
+        except Exception as e:
+            print(f"\n❌ Error while generating/executing query: {e}")
+
+    print("👋 Exiting. Goodbye!")
+
+if __name__ == "__main__":
+    main()
